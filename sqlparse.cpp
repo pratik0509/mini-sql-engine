@@ -3,6 +3,7 @@
 #include<algorithm>
 #include<vector>
 #include<unordered_map>
+#include<unordered_set>
 #include<string>
 #include <boost/algorithm/string.hpp>
 #include "SQLParser.h"
@@ -13,7 +14,7 @@
 #define UNSUCCESSFUL_PARSE "Error while parsing"
 #define METADATA_FILE "files/metadata.txt"
 #define TABLE_NOT_FOUND "Table not found: "
-#define INVALID_SELECT_LIST_INT 4
+#define INVALID_WHERE_CLAUSE 4
 #define INVALID_SELECT_LIST_INT 4
 #define TABLE_NOT_FOUND_INT 3
 #define UNSUCCESSFUL_PARSE_INT 2
@@ -24,7 +25,7 @@
 #define echon(STR,NUM) std::cerr << STR << NUM << std::endl;
 #define uvmap std::unordered_map<std::string, std::vector<std::string>>
 #define vstring std::vector<std::string>>
-
+#define suset std::unordered_set<std::string>
 
 bool in_scope(const hsql::SQLStatement *stmnt) {
     if (!stmnt->isType(hsql::kStmtSelect)) {
@@ -94,18 +95,20 @@ bool check_table_exists(uvmap metadata, std::string name) {
     return metadata.find(name) != metadata.end();
 }
 
-bool exists_table(uvmap metadata, hsql::TableRef *tables) {
+bool exists_table(uvmap metadata, hsql::TableRef *tables, suset &tables_referenced) {
     bool flag = true;
     std::string name = "";
     if(tables->type == hsql::kTableName) {
         name = tables->getName();
         flag = flag && check_table_exists(metadata, name);
+        tables_referenced.insert(name);
     } else if (tables->type == hsql::kTableCrossProduct) {
         for (auto table : *tables->list) {
             name = table->getName();
             flag = flag && check_table_exists(metadata, name);
             if (!flag)
                 break;
+            tables_referenced.insert(name);
         }
     } else {
         flag = false;
@@ -121,7 +124,8 @@ std::vector<hsql::TableRef*> get_tables(hsql::TableRef *tables) {
     return std::vector<hsql::TableRef*>{tables};
 }
 
-bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list, hsql::TableRef *tables) {
+bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list,
+            hsql::TableRef *tables, const suset &tables_used) {
     if (list.size() == 1 && (list[0]->type == hsql::kExprStar || list[0]->type == hsql::kExprFunctionRef))
         return true;
     bool flag = true;
@@ -129,7 +133,8 @@ bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list, hsql::TableRe
     for (auto col: list) {
         if (col->hasTable()) {
             flag = flag && (metadata[col->table].end() !=
-                    find(metadata[col->table].begin(), metadata[col->table].end(), col->name));
+                    find(metadata[col->table].begin(), metadata[col->table].end(), col->name)) &&
+                    tables_used.find(col->table) != tables_used.end();
             if (!flag)
                 err_msg = "Column: " + std::string(col->name) + " not found!!";
         } else {
@@ -137,8 +142,11 @@ bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list, hsql::TableRe
             int occurrence = 0;
             for (auto table: table_list) {
                 occurrence += 
-                    (std::find(metadata[table->getName()].begin(), metadata[table->getName()].end(),
-                    col->name) != metadata[table->getName()].end()) ? 1 : 0;
+                    (
+                        std::find(metadata[table->getName()].begin(), metadata[table->getName()].end(),
+                        col->name) != metadata[table->getName()].end() &&
+                        tables_used.find(table->getName()) != tables_used.end()
+                    ) ? 1 : 0;
             }
             if (occurrence == 0) {
                 err_msg = "Column: " + std::string(col->name) + " not found!";
@@ -149,21 +157,46 @@ bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list, hsql::TableRe
                 flag = false;
             }
         }
-        if (!flag) {
-            eecho(err_msg)
-            break;
+        if (!flag) break;
+    }
+    eecho(err_msg)
+    return flag;
+}
+
+bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent, const suset &tables_used) {
+    bool flag = true;
+    std::string err_msg = "";
+    if (!expr->isType(hsql::kExprColumnRef)) return flag;
+    if (expr->hasTable()) {
+        if (tables_used.find(expr->table) == tables_used.end()) {
+            err_msg = "Table: " + std::string(expr->table) + "not specified in where clause!";
+            flag = false;
+        } else {
+            flag = flag &&
+                std::find(metadata[expr->table].begin(), metadata[expr->table].end(), expr->getName()) != metadata[expr->table].end();
+                if (!flag)
+                    err_msg = "Column: " + std::string(expr->name) + " not found!!";
+        }
+    } else {
+        int occurrence = 0;
+        for (auto table: tables_used) {
+            occurrence += 
+            std::find(metadata[table].begin(), metadata[table].end(), expr->name) != metadata[table].end() ? 1 : 0;
+        }
+        if (occurrence == 0) {
+            err_msg = "Column: " + std::string(expr->name) + " not found!";
+            flag = false;
+        }
+        if (occurrence > 1) {
+            err_msg = "Column: " + std::string(expr->name) + " ambiguous!";
+            flag = false;
         }
     }
+    eecho(err_msg)
     return flag;
 }
 
-bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent) {
-    bool flag = true;
-    
-    return flag;
-}
-
-bool valid_where(uvmap &metadata, hsql::Expr* where_clause) {
+bool valid_where(uvmap &metadata, hsql::Expr* where_clause, const suset &tables_used) {
     if(!where_clause)
         return true;
     if (!where_clause->isType(hsql::kExprOperator))
@@ -178,14 +211,14 @@ bool valid_where(uvmap &metadata, hsql::Expr* where_clause) {
     };
     if (std::find(supported_op.begin(), supported_op.end(), where_clause->opType) != supported_op.end())
         return
-            valid_where_operand(metadata, where_clause->expr, where_clause) &&
-            valid_where_operand(metadata, where_clause->expr2, where_clause);
+            valid_where_operand(metadata, where_clause->expr, where_clause, tables_used) &&
+            valid_where_operand(metadata, where_clause->expr2, where_clause, tables_used);
     if (where_clause->opType == hsql::OperatorType::kOpAnd || where_clause->opType == hsql::OperatorType::kOpOr)
         return
-            valid_where_operand(metadata, where_clause->expr->expr, where_clause->expr) &&
-            valid_where_operand(metadata, where_clause->expr->expr2, where_clause->expr) &&
-            valid_where_operand(metadata, where_clause->expr2->expr, where_clause->expr2) &&
-            valid_where_operand(metadata, where_clause->expr2->expr2, where_clause->expr2);
+            valid_where_operand(metadata, where_clause->expr->expr, where_clause->expr, tables_used) &&
+            valid_where_operand(metadata, where_clause->expr->expr2, where_clause->expr, tables_used) &&
+            valid_where_operand(metadata, where_clause->expr2->expr, where_clause->expr2, tables_used) &&
+            valid_where_operand(metadata, where_clause->expr2->expr2, where_clause->expr2, tables_used);
 
     return false;
 }
@@ -205,15 +238,17 @@ int main(int argv, char *argc[]) {
         load_metadata(metadata);
         // print_metadata(metadata);
         for (auto i = 0u; i < parsed_query.size(); ++i) {
+            suset tables_referenced;
             auto stmnt = parsed_query.getStatement(i);
             hsql::printStatementInfo(stmnt);
             if(!in_scope(stmnt)) continue;
             hsql::SelectStatement* select_stmnt = (hsql::SelectStatement*)stmnt;
             std::vector<hsql::Expr*> select_list = *select_stmnt->selectList;
             hsql::TableRef *select_table = select_stmnt->fromTable;
-            if(!exists_table(metadata, select_table)) return -TABLE_NOT_FOUND_INT;
-            if(!valid_columns(metadata, select_list, select_table)) return -INVALID_SELECT_LIST_INT;
+            if(!exists_table(metadata, select_table, tables_referenced)) return -TABLE_NOT_FOUND_INT;
+            if(!valid_columns(metadata, select_list, select_table, tables_referenced)) return -INVALID_SELECT_LIST_INT;
             hsql::Expr* where_clause = select_stmnt->whereClause;
+            if(!valid_where(metadata, where_clause, tables_referenced)) return -INVALID_WHERE_CLAUSE;
         }
     } else {
         eecho(UNSUCCESSFUL_PARSE)
