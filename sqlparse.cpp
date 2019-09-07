@@ -23,14 +23,16 @@
 #define TABLE_NOT_FOUND_INT 3
 #define UNSUCCESSFUL_PARSE_INT 2
 #define USAGE_ERROR_INT 1
-#define echo(STR) std::cerr << STR << std::endl;
+#define echo(STR) std::cout << STR << std::endl;
 #define eecho(STR) std::cerr << STR << std::endl;
 #define eechon(STR,NUM) std::cerr << STR << NUM << std::endl;
-#define echon(STR,NUM) std::cerr << STR << NUM << std::endl;
+#define echon(STR,NUM) std::cout << STR << NUM << std::endl;
 #define uvmap std::unordered_map<std::string, std::vector<std::string>>
 #define umapsll std::unordered_map<std::string, ll>
 #define vstring std::vector<std::string>
 #define sset std::set<std::string>
+#define svrumap std::unordered_map<std::string, std::vector<Row>>
+
 
 bool in_scope(const hsql::SQLStatement *stmnt) {
     if (!stmnt->isType(hsql::kStmtSelect)) {
@@ -79,6 +81,11 @@ class Row {
 
     ll& operator[] (std::string index) {
         return data[index];
+    }
+
+    std::string get_value(std::string index) {
+        // eecho(index)
+        return std::to_string(data[index]);
     }
 };
 
@@ -163,6 +170,46 @@ class Condition {
         };
         return value;
     }
+
+    void set_operator(hsql::OperatorType o) {
+        op = o;
+    }
+
+    void set_columns(Column c1, Column c2) {
+        col1 = c1;
+        col2 = c2;
+    }
+};
+
+class ConditionList {
+    private:
+    std::vector<Condition> cond;
+    hsql::OperatorType op;
+    public:
+    ConditionList() {
+        op = hsql::OperatorType::kOpAnd;
+    }
+    void add_condition(const Condition& c) {
+        cond.push_back(c);
+    }
+    void set_op(hsql::OperatorType o) {
+        op = o;
+    }
+    bool get_truth(Row& r1, Row& r2) {
+        bool truth = op != hsql::OperatorType::kOpOr;
+        for (auto a: cond) {
+            switch(op) {
+                case hsql::OperatorType::kOpAnd:
+                truth = truth && a.get_validity(r1, r2);
+                break;
+                case hsql::OperatorType::kOpOr:
+                truth = truth || a.get_validity(r1, r2);
+                default:
+                truth = false;
+            }
+        }
+        return truth;
+    }
 };
 
 const std::vector<hsql::OperatorType> Condition::supported_op = std::vector<hsql::OperatorType>{
@@ -175,11 +222,11 @@ const std::vector<hsql::OperatorType> Condition::supported_op = std::vector<hsql
     };
 
 void get_state(std::string& line, META_TYPE& state) {
-    if (line == "<BEGIN_TABLE>") {
+    if (line == "<begin_table>") {
         state = META_TYPE::BEGIN_TABLE;
     } else if (state == META_TYPE::BEGIN_TABLE) {
         state = META_TYPE::TABLE_NAME;
-    } else if (line == "<END_TABLE>") {
+    } else if (line == "<end_table>") {
         state = META_TYPE::END_TABLE;
     } else {
         state = META_TYPE::COLUMN_NAME;
@@ -192,7 +239,7 @@ void load_metadata(uvmap& metadata) {
     std::string line, cur_table;
     META_TYPE state = META_TYPE::END_TABLE;
     while (infile >> line) {
-        boost::to_upper(line);
+        boost::to_lower(line);
         get_state(line, state);
         switch (state) {
             case META_TYPE::TABLE_NAME:
@@ -259,7 +306,9 @@ std::vector<hsql::TableRef*> get_tables(hsql::TableRef *tables) {
 bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list,
             hsql::TableRef *tables, const sset &tables_used, std::vector<Column> &columns_ref) {
     if (list.size() == 1 && list[0]->type == hsql::kExprStar) {
-        columns_ref.push_back(Column());
+        for (auto t: tables_used)
+            for (auto c: metadata[t])
+                columns_ref.push_back(Column(t, c));
         return true;
     }
     if (list.size() == 1 && list[0]->type == hsql::kExprFunctionRef) {
@@ -309,7 +358,7 @@ bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list,
     return flag;
 }
 
-bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent, const sset &tables_used) {
+bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent, const sset &tables_used, Column &c) {
     bool flag = true;
     std::string err_msg = "";
     if (!expr->isType(hsql::kExprColumnRef)) return flag;
@@ -322,18 +371,19 @@ bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent, 
                 std::find(metadata[expr->table].begin(), metadata[expr->table].end(), expr->getName()) != metadata[expr->table].end();
                 if (!flag)
                     err_msg = "Column: " + std::string(expr->name) + " not found!!";
+                else
+                    c = Column(expr->table, expr->getName());
         }
     } else {
         int occurrence = 0;
         for (auto table: tables_used) {
             occurrence += 
-            std::find(metadata[table].begin(), metadata[table].end(), expr->name) != metadata[table].end() ? 1 : 0;
+            std::find(metadata[table].begin(), metadata[table].end(), expr->name) != metadata[table].end() ? (c = Column(table, expr->name), 1) : 0;
         }
         if (occurrence == 0) {
             err_msg = "Column: " + std::string(expr->name) + " not found!";
             flag = false;
-        }
-        if (occurrence > 1) {
+        } else if (occurrence > 1) {
             err_msg = "Column: " + std::string(expr->name) + " ambiguous!";
             flag = false;
         }
@@ -342,37 +392,94 @@ bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent, 
     return flag;
 }
 
-bool valid_where(uvmap &metadata, hsql::Expr* where_clause, const sset &tables_used) {
+bool valid_where(uvmap &metadata, hsql::Expr* where_clause, const sset &tables_used, ConditionList &cond) {
     if(!where_clause)
         return true;
     if (!where_clause->isType(hsql::kExprOperator))
         return false;
-    std::vector<hsql::OperatorType> supported_op{
-        hsql::OperatorType::kOpEquals,
-        hsql::OperatorType::kOpLess,
-        hsql::OperatorType::kOpLessEq,
-        hsql::OperatorType::kOpGreater,
-        hsql::OperatorType::kOpGreaterEq,
-        hsql::OperatorType::kOpUnaryMinus,
-    };
-    if (std::find(supported_op.begin(), supported_op.end(), where_clause->opType) != supported_op.end())
-        return
-            valid_where_operand(metadata, where_clause->expr, where_clause, tables_used) &&
-            valid_where_operand(metadata, where_clause->expr2, where_clause, tables_used);
-    if (where_clause->opType == hsql::OperatorType::kOpAnd || where_clause->opType == hsql::OperatorType::kOpOr)
-        return
-            valid_where_operand(metadata, where_clause->expr->expr, where_clause->expr, tables_used) &&
-            valid_where_operand(metadata, where_clause->expr->expr2, where_clause->expr, tables_used) &&
-            valid_where_operand(metadata, where_clause->expr2->expr, where_clause->expr2, tables_used) &&
-            valid_where_operand(metadata, where_clause->expr2->expr2, where_clause->expr2, tables_used);
+    bool validity = false;
+    if (std::find(Condition::supported_op.begin(), Condition::supported_op.end(), where_clause->opType) !=
+        Condition::supported_op.end()) {
+        Condition cond1;
+        Column c1, c2;
+        validity = valid_where_operand(metadata, where_clause->expr, where_clause, tables_used, c1) &&
+        valid_where_operand(metadata, where_clause->expr2, where_clause, tables_used, c2);
+        cond1.set_operator(where_clause->opType);
+        cond1.set_columns(c1, c2);
+        cond.add_condition(cond1);
+    } else if (where_clause->opType == hsql::OperatorType::kOpAnd || where_clause->opType == hsql::OperatorType::kOpOr){
+        Column c1, c2, c3, c4;
+        Condition cond1, cond2;
+        validity = valid_where_operand(metadata, where_clause->expr->expr, where_clause->expr, tables_used, c1) &&
+            valid_where_operand(metadata, where_clause->expr->expr2, where_clause->expr, tables_used, c2) &&
+            valid_where_operand(metadata, where_clause->expr2->expr, where_clause->expr2, tables_used, c3) &&
+            valid_where_operand(metadata, where_clause->expr2->expr2, where_clause->expr2, tables_used, c4);
+        cond1.set_operator(where_clause->expr->opType);
+        cond1.set_columns(c1, c2);
+        cond1.set_operator(where_clause->expr2->opType);
+        cond1.set_columns(c3, c4);
+        cond.add_condition(cond1);
+        cond.add_condition(cond2);
+        cond.set_op(where_clause->opType);
+    }
+    return validity;
+}
 
-    return false;
+std::vector<Row> read_table(std::string path, std::string table_name, uvmap &metadata) {
+    std::ifstream infile(path);
+    std::string line;
+    std::vector<Row> table;
+    while (infile >> line) {
+        table.push_back(Row(table_name, line, metadata));
+    }
+    return table;
+}
+
+void pretty_print(std::vector<std::string> list) {
+    std::cout << "|\t";
+    for (auto str: list) {
+        std::cout << str << "\t|\t";
+    }
+    std::cout << std::endl;
+}
+
+void pretty_print(std::vector<Column> list) {
+    std::cout << "|";
+    for (auto str: list) {
+        std::cout << str.get_full_name() << "\t|";
+    }
+    std::cout << std::endl;
+}
+
+
+void single_table_execute(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
+    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata) {
+    std::string path = "files/" + *tables_ref.begin() + ".csv";
+    // eecho(path)
+    auto table = read_table(path, *tables_ref.begin(), metadata);
+    pretty_print(columns_ref);
+    for (auto r: table) {
+        std::vector<std::string> line;
+        for (auto c: columns_ref) {
+            line.push_back(r.get_value(c.get_column()));
+        }
+        pretty_print(line);
+    }
+}
+
+void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
+    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata) {
+    
 }
 
 void execute_query(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
-    std::vector<Column> columns_ref) {
+    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata) {
     if (columns_ref.size() < 1) return;
-
+    if (tables_ref.size() < 2) {
+        single_table_execute(select_list, tables_ref, columns_ref, cond, metadata);
+    } else {
+        multi_table_execute(select_list, tables_ref, columns_ref, cond, metadata);
+    }
     return;
 }
 
@@ -382,7 +489,7 @@ int main(int argv, char *argc[]) {
         return -USAGE_ERROR_INT;
     }
     std::string args(argc[1]);
-    const std::string query(boost::to_upper_copy(args));
+    const std::string query(boost::to_lower_copy(args));
     hsql::SQLParserResult parsed_query;
     hsql::SQLParser::parse(query, &parsed_query);
     if (parsed_query.isValid()) {
@@ -393,6 +500,7 @@ int main(int argv, char *argc[]) {
         for (auto i = 0u; i < parsed_query.size(); ++i) {
             sset tables_ref;
             std::vector<Column> columns_ref;
+            ConditionList cond;
             auto stmnt = parsed_query.getStatement(i);
             // hsql::printStatementInfo(stmnt);
             if(!in_scope(stmnt)) continue;
@@ -402,8 +510,8 @@ int main(int argv, char *argc[]) {
             if(!exists_table(metadata, select_table, tables_ref)) return -TABLE_NOT_FOUND_INT;
             if(!valid_columns(metadata, select_list, select_table, tables_ref, columns_ref)) return -INVALID_SELECT_LIST_INT;
             hsql::Expr* where_clause = select_stmnt->whereClause;
-            if(!valid_where(metadata, where_clause, tables_ref)) return -INVALID_WHERE_CLAUSE;
-            execute_query(select_list, tables_ref, columns_ref);
+            if(!valid_where(metadata, where_clause, tables_ref, cond)) return -INVALID_WHERE_CLAUSE;
+            execute_query(select_list, tables_ref, columns_ref, cond, metadata);
         }
     } else {
         eecho(UNSUCCESSFUL_PARSE)
