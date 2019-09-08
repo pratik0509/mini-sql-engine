@@ -118,6 +118,10 @@ class Column {
         return column_name;
     }
 
+    bool is_type(ColumnType t) {
+        return t == type;
+    }
+
     std::string get_table() {
         return table_name;
     }
@@ -311,8 +315,8 @@ bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list,
                 columns_ref.push_back(Column(t, c));
         return true;
     }
-    if (list.size() == 1 && list[0]->type == hsql::kExprFunctionRef) {
-        columns_ref.push_back(Column(*tables_used.begin(), list[0]->expr->getName(), list[0]->getName()));
+    if (list.size() == 1 && list[0]->isType( hsql::kExprFunctionRef)) {
+        columns_ref.push_back(Column(*tables_used.begin(), (*list[0]->exprList)[0]->getName(), list[0]->getName()));
         return true;
     }
       
@@ -435,12 +439,13 @@ std::vector<Row> read_table(std::string path, std::string table_name, uvmap &met
     return table;
 }
 
-void pretty_print(std::vector<std::string> list) {
-    std::cout << "|\t";
-    for (auto str: list) {
-        std::cout << str << "\t|\t";
+void pretty_print(std::vector<vstring> list) {
+    for (auto line : list) {
+        std::cout << "|\t";
+        for (auto str: line)
+            std::cout << str << "\t|\t";
+        std::cout << std::endl;
     }
-    std::cout << std::endl;
 }
 
 void pretty_print(std::vector<Column> list) {
@@ -451,20 +456,80 @@ void pretty_print(std::vector<Column> list) {
     std::cout << std::endl;
 }
 
+template<typename T>
+void pretty_print(T val) {
+    std::cout << "|\t" << val << "\t|" << std::endl;
+}
+
+class State {
+    private:
+    static ll minimum;
+    static ll maximum;
+    static ll count;
+    static double average;
+    static ll sum;
+    static bool is_init;
+    public:
+    static void set() {
+        minimum = LONG_LONG_MAX;
+        maximum = LONG_LONG_MIN;
+        average = 0;
+        sum = 0;
+        count = 0;
+        is_init = true;
+    }
+    static bool is_set() {
+        return is_init;
+    }
+    static void add(std::string func, ll num) {
+        if (func == "min") minimum = std::min(minimum, num);
+        else if (func == "max") maximum = std::max(maximum, num);
+        sum += num;
+        ++count;
+        average = (sum*1.0)/count;
+    }
+    static double get(std::string func) {
+        if (func == "min") return minimum;
+        else if (func == "max") return maximum;
+        else if (func == "sum") return sum;
+        return average;
+    }
+};
+ll State::minimum = LONG_LONG_MAX;
+ll State::maximum = LONG_LONG_MIN;
+double State::average = 0;
+ll State::sum = 0;
+ll State::count = 0;
+bool State::is_init = false;
+
 
 void single_table_execute(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
-    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata) {
+    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata, bool distinct) {
     std::string path = "files/" + *tables_ref.begin() + ".csv";
     // eecho(path)
+    std::vector<vstring> output;
+    std::set<vstring> unique;
     auto table = read_table(path, *tables_ref.begin(), metadata);
     pretty_print(columns_ref);
+    State::set();
+    bool has_func = false;
     for (auto r: table) {
-        std::vector<std::string> line;
+        
+        vstring line;
         for (auto c: columns_ref) {
-            line.push_back(r.get_value(c.get_column()));
+            if(c.is_type(ColumnType::FUNCTION))
+                State::add(c.get_function(), r[c.get_column()]), has_func = true;
+            else
+                line.push_back(r.get_value(c.get_column()));
         }
-        pretty_print(line);
+        if (distinct && unique.count(line) && !has_func) continue;
+        unique.insert(line);
+        output.push_back(line);
     }
+    if(has_func)
+        pretty_print(State::get(columns_ref[0].get_function()));
+    else
+        pretty_print(output);
 }
 
 void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
@@ -473,10 +538,10 @@ void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset
 }
 
 void execute_query(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
-    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata) {
+    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata, bool distinct) {
     if (columns_ref.size() < 1) return;
     if (tables_ref.size() < 2) {
-        single_table_execute(select_list, tables_ref, columns_ref, cond, metadata);
+        single_table_execute(select_list, tables_ref, columns_ref, cond, metadata, distinct);
     } else {
         multi_table_execute(select_list, tables_ref, columns_ref, cond, metadata);
     }
@@ -511,7 +576,7 @@ int main(int argv, char *argc[]) {
             if(!valid_columns(metadata, select_list, select_table, tables_ref, columns_ref)) return -INVALID_SELECT_LIST_INT;
             hsql::Expr* where_clause = select_stmnt->whereClause;
             if(!valid_where(metadata, where_clause, tables_ref, cond)) return -INVALID_WHERE_CLAUSE;
-            execute_query(select_list, tables_ref, columns_ref, cond, metadata);
+            execute_query(select_list, tables_ref, columns_ref, cond, metadata, select_stmnt->selectDistinct);
         }
     } else {
         eecho(UNSUCCESSFUL_PARSE)

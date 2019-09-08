@@ -9,3 +9,9 @@ table2
 B
 D
 <end_table>
+<begin_table>
+table3
+E
+F
+G
+<end_table>
