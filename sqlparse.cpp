@@ -564,10 +564,18 @@ bool check_invalid(Row& r, ConditionList& cond) {
     bool truth = cond.get_truth();
     auto cond_list = cond.get_cond();
     for (auto c: cond_list) {
-        if (c.col1.is_type(ColumnType::CONSTANT) || c.col2.is_type(ColumnType::CONSTANT))
+        // eecho("---------")
+        // eecho(r.get_table())
+        // eecho(c.col1.get_table())
+        // eecho(c.col2.get_table())
+        if(r.get_table() != c.col1.get_table() && r.get_table() != c.col2.get_table())
+            continue;
+        else if (c.col1.is_type(ColumnType::CONSTANT) || c.col2.is_type(ColumnType::CONSTANT))
             truth = cond.get_truth(truth, c.get_validity(r));
         else
             truth = cond.get_truth(truth, c.get_validity(r, r));
+        // eecho(truth)
+        // eecho("---------")
     }
     return !truth;
 }
@@ -601,8 +609,32 @@ void single_table_execute(const std::vector<hsql::Expr*> &select_list, const sse
 }
 
 void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
-    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata) {
-    
+    std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata, bool distinct) {
+    std::map<std::string, std::vector<Row>> tables;
+    for (auto t: tables_ref) {
+        std::string path = "files/" + t + ".csv";
+        tables[t] = read_table(path, t, metadata);
+    }
+    pretty_print(columns_ref);
+    auto t_itr = tables_ref.begin();
+    std::string t1 = *t_itr, t2 = *(++t_itr);
+    std::vector<vstring> output;
+    std::set<vstring> unique;
+    for (auto r1: tables[t1]) {
+        for (auto r2: tables[t2]) {
+            vstring line;
+            if(check_invalid(r1, cond)&&check_invalid(r2, cond)) continue;
+            for (auto c: columns_ref) {
+                line.push_back((c.get_table() == t1)?
+                r1.get_value(c.get_column()):
+                r2.get_value(c.get_column()));
+            }
+            if (distinct && unique.count(line)) continue;
+            unique.insert(line);
+            output.push_back(line);
+        }
+    }
+    pretty_print(output);
 }
 
 void execute_query(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
@@ -611,7 +643,7 @@ void execute_query(const std::vector<hsql::Expr*> &select_list, const sset &tabl
     if (tables_ref.size() < 2) {
         single_table_execute(select_list, tables_ref, columns_ref, cond, metadata, distinct);
     } else {
-        multi_table_execute(select_list, tables_ref, columns_ref, cond, metadata);
+        multi_table_execute(select_list, tables_ref, columns_ref, cond, metadata, distinct);
     }
     return;
 }
