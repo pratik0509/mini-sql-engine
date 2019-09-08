@@ -223,11 +223,12 @@ class Condition {
         };
         return value;
     }
-
     void set_operator(hsql::OperatorType o) {
         op = o;
     }
-
+    hsql::OperatorType get_operator() {
+        return op;
+    }
     void set_columns(Column c1, Column c2) {
         col1 = c1;
         col2 = c2;
@@ -238,11 +239,16 @@ class ConditionList {
     private:
     std::vector<Condition> cond;
     hsql::OperatorType op;
+    bool join;
     public:
+    Condition join_cnd;
     ConditionList() {
+        join = false;
         op = hsql::OperatorType::kOpAnd;
     }
-    void add_condition(const Condition& c) {
+    void add_condition(Condition& c) {
+        if(c.get_operator() == hsql::OperatorType::kOpEquals)
+        join = true, join_cnd = c;
         cond.push_back(c);
     }
     void set_op(hsql::OperatorType o) {
@@ -250,6 +256,9 @@ class ConditionList {
     }
     bool get_truth() {
         return op == hsql::OperatorType::kOpAnd;
+    }
+    bool has_join() {
+        return join;
     }
     bool get_truth(bool truth_old, bool truth_new) {
         for (auto a: cond) {
@@ -560,22 +569,24 @@ ll State::sum = 0;
 ll State::count = 0;
 bool State::is_init = false;
 
+bool check_invalid(Row& r1, Row& r2, ConditionList& cond) {
+    bool truth = cond.get_truth();
+    truth = (r1.get_table() == cond.join_cnd.col1.get_table())?
+        cond.get_truth(truth, cond.join_cnd.get_validity(r1, r2)):
+        cond.get_truth(truth, cond.join_cnd.get_validity(r2, r1));
+    return !truth;
+}
+
 bool check_invalid(Row& r, ConditionList& cond) {
     bool truth = cond.get_truth();
     auto cond_list = cond.get_cond();
     for (auto c: cond_list) {
-        // eecho("---------")
-        // eecho(r.get_table())
-        // eecho(c.col1.get_table())
-        // eecho(c.col2.get_table())
         if(r.get_table() != c.col1.get_table() && r.get_table() != c.col2.get_table())
             continue;
         else if (c.col1.is_type(ColumnType::CONSTANT) || c.col2.is_type(ColumnType::CONSTANT))
             truth = cond.get_truth(truth, c.get_validity(r));
         else
             truth = cond.get_truth(truth, c.get_validity(r, r));
-        // eecho(truth)
-        // eecho("---------")
     }
     return !truth;
 }
@@ -615,6 +626,14 @@ void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset
         std::string path = "files/" + t + ".csv";
         tables[t] = read_table(path, t, metadata);
     }
+    if(cond.has_join()) {
+        for(auto i=columns_ref.begin(); i != columns_ref.end(); ++i) {
+            if (i->get_full_name()==cond.join_cnd.col1.get_full_name()) {
+                columns_ref.erase(i);
+                break;
+            }
+        }
+    }
     pretty_print(columns_ref);
     auto t_itr = tables_ref.begin();
     std::string t1 = *t_itr, t2 = *(++t_itr);
@@ -623,7 +642,8 @@ void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset
     for (auto r1: tables[t1]) {
         for (auto r2: tables[t2]) {
             vstring line;
-            if(check_invalid(r1, cond)&&check_invalid(r2, cond)) continue;
+            if(cond.has_join()) {if(check_invalid(r1, r2, cond))continue;}
+            else if(check_invalid(r1, cond)&&check_invalid(r2, cond)) continue;
             for (auto c: columns_ref) {
                 line.push_back((c.get_table() == t1)?
                 r1.get_value(c.get_column()):
