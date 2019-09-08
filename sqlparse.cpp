@@ -4,6 +4,7 @@
 #include<vector>
 #include<unordered_map>
 #include<set>
+#include<map>
 #include<string>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -52,7 +53,8 @@ enum META_TYPE {
 enum ColumnType {
     STAR,
     COLUMN,
-    FUNCTION
+    FUNCTION,
+    CONSTANT
 };
 
 class Row {
@@ -94,6 +96,7 @@ class Column {
     std::string table_name;
     std::string column_name;
     std::string function;
+    ll constant;
     ColumnType type;
     public:
     Column(std::string table, std::string column) {
@@ -107,6 +110,10 @@ class Column {
         column_name = column;
         function = func;
         type = ColumnType::FUNCTION;
+    }
+    Column(ll val) {
+        constant = val;
+        type = ColumnType::CONSTANT;
     }
     Column() {
         table_name = "";
@@ -134,7 +141,13 @@ class Column {
         return type;
     }
 
+    ll get_value() {
+        return constant;
+    }
+
     std::string get_full_name() {
+        if (type == ColumnType::CONSTANT)
+            return std::to_string(constant);
         if (type == ColumnType::STAR)
             return "*";
         std::string full_name = table_name + std::string(".") + column_name;
@@ -146,11 +159,47 @@ class Column {
 
 class Condition {
     private:
+    hsql::OperatorType op;
+    std::map<hsql::OperatorType, hsql::OperatorType> trans {
+        {hsql::OperatorType::kOpEquals, hsql::OperatorType::kOpEquals},
+        {hsql::OperatorType::kOpLess, hsql::OperatorType::kOpGreaterEq},
+        {hsql::OperatorType::kOpLessEq, hsql::OperatorType::kOpGreater},
+        {hsql::OperatorType::kOpGreater, hsql::OperatorType::kOpLessEq},
+        {hsql::OperatorType::kOpGreaterEq, hsql::OperatorType::kOpLess}
+    };
+    public:
     Column col1;
     Column col2;
-    hsql::OperatorType op;
-    public:
-    static const std::vector<hsql::OperatorType> supported_op; 
+    static const std::vector<hsql::OperatorType> supported_op;
+    bool get_validity(Row &r1) {
+        bool value = true;
+        if (col1.is_type(ColumnType::CONSTANT)) {
+            auto t = col1;
+            col1 = col2;
+            col2 = t;
+            op = trans[op];
+        }
+        switch(op) {
+        case hsql::OperatorType::kOpEquals :
+            value = r1[col1.get_column()] == col2.get_value();
+        break;
+        case hsql::OperatorType::kOpLess :
+            value = r1[col1.get_column()] < col2.get_value();
+        break;
+        case hsql::OperatorType::kOpLessEq :
+            value = r1[col1.get_column()] <= col2.get_value();
+        break;
+        case hsql::OperatorType::kOpGreater :
+            value = r1[col1.get_column()] > col2.get_value();
+        break;
+        case hsql::OperatorType::kOpGreaterEq :
+            value = r1[col1.get_column()] >= col2.get_value();
+        break;
+        default:
+        value = false;
+        };
+        return value;
+    }
     bool get_validity(Row &r1, Row &r2) {
         bool value = true;
         switch(op) {
@@ -199,20 +248,26 @@ class ConditionList {
     void set_op(hsql::OperatorType o) {
         op = o;
     }
-    bool get_truth(Row& r1, Row& r2) {
-        bool truth = op != hsql::OperatorType::kOpOr;
+    bool get_truth() {
+        return op == hsql::OperatorType::kOpAnd;
+    }
+    bool get_truth(bool truth_old, bool truth_new) {
         for (auto a: cond) {
             switch(op) {
                 case hsql::OperatorType::kOpAnd:
-                truth = truth && a.get_validity(r1, r2);
+                truth_new = truth_old && truth_new;
                 break;
                 case hsql::OperatorType::kOpOr:
-                truth = truth || a.get_validity(r1, r2);
+                truth_new = truth_old || truth_new;
+                break;
                 default:
-                truth = false;
+                truth_new = false;
             }
         }
-        return truth;
+        return truth_new;
+    }
+    std::vector<Condition> get_cond() {
+        return cond;
     }
 };
 
@@ -365,7 +420,10 @@ bool valid_columns(uvmap &metadata, std::vector<hsql::Expr*> list,
 bool valid_where_operand(uvmap &metadata, hsql::Expr* expr, hsql::Expr* parent, const sset &tables_used, Column &c) {
     bool flag = true;
     std::string err_msg = "";
-    if (!expr->isType(hsql::kExprColumnRef)) return flag;
+    if (!expr->isType(hsql::kExprColumnRef)) {
+        c = Column(expr->ival);
+        return flag;
+    }
     if (expr->hasTable()) {
         if (tables_used.find(expr->table) == tables_used.end()) {
             err_msg = "Table: " + std::string(expr->table) + "not specified in where clause!";
@@ -420,8 +478,8 @@ bool valid_where(uvmap &metadata, hsql::Expr* where_clause, const sset &tables_u
             valid_where_operand(metadata, where_clause->expr2->expr2, where_clause->expr2, tables_used, c4);
         cond1.set_operator(where_clause->expr->opType);
         cond1.set_columns(c1, c2);
-        cond1.set_operator(where_clause->expr2->opType);
-        cond1.set_columns(c3, c4);
+        cond2.set_operator(where_clause->expr2->opType);
+        cond2.set_columns(c3, c4);
         cond.add_condition(cond1);
         cond.add_condition(cond2);
         cond.set_op(where_clause->opType);
@@ -502,11 +560,21 @@ ll State::sum = 0;
 ll State::count = 0;
 bool State::is_init = false;
 
+bool check_invalid(Row& r, ConditionList& cond) {
+    bool truth = cond.get_truth();
+    auto cond_list = cond.get_cond();
+    for (auto c: cond_list) {
+        if (c.col1.is_type(ColumnType::CONSTANT) || c.col2.is_type(ColumnType::CONSTANT))
+            truth = cond.get_truth(truth, c.get_validity(r));
+        else
+            truth = cond.get_truth(truth, c.get_validity(r, r));
+    }
+    return !truth;
+}
 
 void single_table_execute(const std::vector<hsql::Expr*> &select_list, const sset &tables_ref,
     std::vector<Column> &columns_ref, ConditionList &cond, uvmap &metadata, bool distinct) {
     std::string path = "files/" + *tables_ref.begin() + ".csv";
-    // eecho(path)
     std::vector<vstring> output;
     std::set<vstring> unique;
     auto table = read_table(path, *tables_ref.begin(), metadata);
@@ -514,8 +582,8 @@ void single_table_execute(const std::vector<hsql::Expr*> &select_list, const sse
     State::set();
     bool has_func = false;
     for (auto r: table) {
-        
         vstring line;
+        if(check_invalid(r, cond)) continue;
         for (auto c: columns_ref) {
             if(c.is_type(ColumnType::FUNCTION))
                 State::add(c.get_function(), r[c.get_column()]), has_func = true;
