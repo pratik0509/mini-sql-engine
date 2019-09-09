@@ -247,7 +247,7 @@ class ConditionList {
         op = hsql::OperatorType::kOpAnd;
     }
     void add_condition(Condition& c) {
-        if(c.get_operator() == hsql::OperatorType::kOpEquals)
+        if(c.get_operator() == hsql::OperatorType::kOpEquals && c.col1.is_type(ColumnType::COLUMN) && c.col2.is_type(ColumnType::COLUMN))
         join = true, join_cnd = c;
         cond.push_back(c);
     }
@@ -642,8 +642,9 @@ void multi_table_execute(const std::vector<hsql::Expr*> &select_list, const sset
     for (auto r1: tables[t1]) {
         for (auto r2: tables[t2]) {
             vstring line;
-            if(cond.has_join()) {if(check_invalid(r1, r2, cond))continue;}
-            else if(check_invalid(r1, cond)&&check_invalid(r2, cond)) continue;
+            if(cond.has_join()) {eecho("XX")if(check_invalid(r1, r2, cond))continue;}
+            else if(cond.get_truth() && (check_invalid(r1, cond)||check_invalid(r2, cond))) continue;
+            else if(!cond.get_truth() && (check_invalid(r1, cond)&&check_invalid(r2, cond))) continue;
             for (auto c: columns_ref) {
                 line.push_back((c.get_table() == t1)?
                 r1.get_value(c.get_column()):
